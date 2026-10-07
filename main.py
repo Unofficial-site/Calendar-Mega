@@ -573,7 +573,7 @@ def generate_predictions(
             weekday
         )
 
-        if probability <= 0:
+        if probability <= 0.5:
             continue
 
         if start_minutes is None:
