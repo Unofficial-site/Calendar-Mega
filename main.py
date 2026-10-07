@@ -2,119 +2,71 @@ import os
 import re
 import json
 import math
-import random
 import tempfile
+import html
+
 from datetime import datetime, timedelta, timezone, time
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from xml.etree import ElementTree as ET
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 
-# =========================================================
-# Settings
-# =========================================================
-
 USERNAME = "mega_urtr"
-
-IRIAM_PREFIX = "https://web.iriam.app/s/live/"
 
 RSS_URLS = [
     f"https://fxtwitter.com/{USERNAME}/feed.xml?count=100",
     f"https://fxtwitter.com/{USERNAME}/feed.atom.xml?count=100",
 ]
 
-OUTPUT_ICS = "calendar.ics"
 DATA_FILE = "data.json"
+ICS_FILE = "calendar.ics"
 
 JST = ZoneInfo("Asia/Tokyo")
-UTC = timezone.utc
 
-# 未来何日まで予測するか
 PREDICTION_DAYS = 60
-
-# 学習する過去の履歴数
-HISTORY_LIMIT = 60
-
-# 実績・予測イベントの長さ
+MIN_ACTIVE_DAYS = 7
 EVENT_DURATION_MINUTES = 30
 
-# RSS取得タイムアウト
-HTTP_TIMEOUT = 20
-
-# RSS User-Agent
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; Calendar-Mega/1.0; "
-    "+https://github.com/Unofficial-site/Calendar-Mega)"
+IRIAM_PATTERN = re.compile(
+    r"https://web\.iriam\.app/s/live/[A-Za-z0-9_-]+",
+    re.IGNORECASE
 )
 
-# ---------------------------------------------------------
-# 学習設定
-# ---------------------------------------------------------
-
-# 予測確率がこの値未満なら、その日は予測しない。
-#
-# 例:
-# 0.60 = 過去にその曜日で60%以上の頻度なら予測
-#
-# ただし「曜日そのものを予測対象から削除する」のではなく、
-# 未来の日付ごとに過去の発生率を計算する。
-MIN_PREDICTION_PROBABILITY = 0.20
-
-# 学習データが少なすぎる場合の予測を抑制
-MIN_HISTORY_FOR_PREDICTION = 7
-
-# ランダム予測ではなく、再現可能な判定をするための係数
-RANDOM_SEED = 20261007
+STATUS_PATTERN = re.compile(
+    r"status[/:](\d+)",
+    re.IGNORECASE
+)
 
 
-# =========================================================
-# HTTP
-# =========================================================
+def atomic_write(path, content):
+    directory = os.path.dirname(os.path.abspath(path)) or "."
 
-def fetch_url(url):
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": (
-                "application/rss+xml, "
-                "application/atom+xml, "
-                "application/xml, "
-                "text/xml"
-            ),
-        },
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".tmp_",
+        dir=directory,
+        text=True
     )
 
-    with urlopen(
-        request,
-        timeout=HTTP_TIMEOUT,
-    ) as response:
-        return response.read()
+    try:
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+            newline=""
+        ) as f:
+            f.write(content)
 
+        os.replace(temp_path, path)
 
-# =========================================================
-# XML helpers
-# =========================================================
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
-def local_name(tag):
-    return tag.split("}", 1)[-1]
-
-
-def child_text(element, names):
-    names = set(names)
-
-    for child in element.iter():
-        if local_name(child.tag) in names:
-            if child.text:
-                return child.text.strip()
-
-    return None
-
-
-# =========================================================
-# Date parsing
-# =========================================================
 
 def parse_datetime(value):
     if not value:
@@ -122,568 +74,409 @@ def parse_datetime(value):
 
     value = value.strip()
 
-    # ISO 8601
     try:
         dt = datetime.fromisoformat(
             value.replace("Z", "+00:00")
         )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
+            dt = dt.replace(tzinfo=timezone.utc)
 
         return dt.astimezone(JST)
 
-    except Exception:
+    except ValueError:
         pass
 
-    # RFC 2822
     try:
         dt = parsedate_to_datetime(value)
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
+            dt = dt.replace(tzinfo=timezone.utc)
 
         return dt.astimezone(JST)
 
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
-# =========================================================
-# X post ID
-# =========================================================
-
-def extract_post_id(value):
+def normalize_text(value):
     if not value:
-        return None
+        return ""
 
-    patterns = [
-        r"/status/(\d+)",
-        r"status[/:](\d+)",
-    ]
+    value = html.unescape(value)
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            value,
-        )
+    value = re.sub(
+        r"<br\s*/?>",
+        "\n",
+        value,
+        flags=re.IGNORECASE
+    )
+
+    value = re.sub(
+        r"<[^>]+>",
+        "",
+        value
+    )
+
+    return value.strip()
+
+
+def fetch_url(url):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; Calendar-Mega/1.0; "
+                "+https://github.com/Unofficial-site/Calendar-Mega)"
+            ),
+            "Accept": (
+                "application/rss+xml, "
+                "application/atom+xml, "
+                "application/xml, "
+                "text/xml, "
+                "*/*"
+            ),
+        }
+    )
+
+    with urlopen(request, timeout=20) as response:
+        return response.read()
+
+
+def get_element_text(element, names):
+    for name in names:
+        child = element.find(name)
+
+        if child is not None and child.text:
+            return child.text.strip()
+
+        for child in element.iter():
+            tag = child.tag
+
+            if isinstance(tag, str):
+                local_name = tag.split("}")[-1]
+
+                if local_name == name and child.text:
+                    return child.text.strip()
+
+    return ""
+
+
+def extract_post_id(item):
+    candidates = []
+
+    for child in item.iter():
+        tag = child.tag
+
+        if not isinstance(tag, str):
+            continue
+
+        local_name = tag.split("}")[-1].lower()
+
+        if local_name in ("link", "id", "guid"):
+            if child.text:
+                candidates.append(child.text.strip())
+
+            href = child.attrib.get("href")
+
+            if href:
+                candidates.append(href)
+
+    for value in candidates:
+        match = STATUS_PATTERN.search(value)
 
         if match:
             return match.group(1)
 
-    if re.fullmatch(
-        r"\d{10,30}",
-        value,
-    ):
-        return value
-
     return None
 
-
-# =========================================================
-# IRIAM URL
-# =========================================================
-
-def extract_iriam_url(text):
-    if not text:
-        return None
-
-    match = re.search(
-        r"https://web\.iriam\.app/s/live/[A-Za-z0-9_-]+",
-        text,
-    )
-
-    if match:
-        return match.group(0)
-
-    return None
-
-
-# =========================================================
-# RSS / Atom parser
-# =========================================================
 
 def parse_feed(xml_bytes):
     root = ET.fromstring(xml_bytes)
 
-    results = []
+    posts = []
+    items = []
 
     for element in root.iter():
+        tag = element.tag
 
-        if local_name(element.tag) not in (
-            "item",
-            "entry",
-        ):
+        if not isinstance(tag, str):
             continue
 
-        title = child_text(
-            element,
-            ["title"],
-        )
+        local_name = tag.split("}")[-1].lower()
 
-        description = child_text(
-            element,
-            [
-                "description",
-                "summary",
-                "content",
-            ],
-        )
+        if local_name in ("item", "entry"):
+            items.append(element)
 
-        link = child_text(
-            element,
-            ["link"],
-        )
-
-        guid = child_text(
-            element,
-            [
-                "guid",
-                "id",
-            ],
-        )
-
-        published = child_text(
-            element,
-            [
-                "pubDate",
-                "published",
-                "updated",
-                "date",
-            ],
-        )
-
-        post_datetime = parse_datetime(
-            published
-        )
-
-        if not post_datetime:
-            continue
-
-        combined_text = "\n".join(
-            value
-            for value in [
-                title,
-                description,
-                link,
-                guid,
-            ]
-            if value
-        )
-
-        iriam_url = extract_iriam_url(
-            combined_text
-        )
-
-        if not iriam_url:
-            continue
-
-        post_id = (
-            extract_post_id(guid)
-            or extract_post_id(link)
-            or extract_post_id(combined_text)
-        )
+    for item in items:
+        post_id = extract_post_id(item)
 
         if not post_id:
             continue
 
-        results.append(
-            {
-                "post_id": post_id,
-                "datetime": post_datetime.isoformat(),
-                "iriam_url": iriam_url,
-            }
+        title = get_element_text(
+            item,
+            ["title"]
         )
 
-    return results
+        description = get_element_text(
+            item,
+            ["description", "summary", "content"]
+        )
 
+        link = ""
 
-# =========================================================
-# Fetch posts
-# =========================================================
+        for child in item.iter():
+            tag = child.tag
 
-def fetch_posts():
+            if not isinstance(tag, str):
+                continue
 
-    errors = []
+            local_name = tag.split("}")[-1].lower()
 
-    for url in RSS_URLS:
+            if local_name == "link":
+                href = child.attrib.get("href")
 
-        try:
+                if href:
+                    link = href
+                    break
 
-            print(
-                f"[INFO] RSS取得: {url}"
+                if child.text:
+                    link = child.text.strip()
+                    break
+
+        published = get_element_text(
+            item,
+            [
+                "pubDate",
+                "published",
+                "updated",
+                "date"
+            ]
+        )
+
+        dt = parse_datetime(published)
+
+        if dt is None:
+            continue
+
+        text = normalize_text(
+            title + "\n" + description
+        )
+
+        iriam_match = IRIAM_PATTERN.search(text)
+
+        if not iriam_match:
+            continue
+
+        iriam_url = iriam_match.group(0)
+
+        if not link:
+            link = (
+                f"https://x.com/"
+                f"{USERNAME}/status/{post_id}"
             )
 
-            xml = fetch_url(url)
+        posts.append({
+            "post_id": str(post_id),
+            "datetime": dt.isoformat(),
+            "text": text,
+            "url": link,
+            "iriam_url": iriam_url,
+        })
 
-            posts = parse_feed(xml)
+    return posts
+
+
+def fetch_posts():
+    errors = []
+    all_posts = {}
+
+    for rss_url in RSS_URLS:
+        try:
+            xml_bytes = fetch_url(rss_url)
+            posts = parse_feed(xml_bytes)
 
             if posts:
+                for post in posts:
+                    all_posts[post["post_id"]] = post
 
                 print(
-                    f"[INFO] IRIAM投稿検出: "
-                    f"{len(posts)}件"
+                    f"RSS取得成功: {rss_url} "
+                    f"({len(posts)}件)"
+                )
+            else:
+                print(
+                    f"RSS取得成功だが対象投稿なし: "
+                    f"{rss_url}"
                 )
 
-                return posts
-
+        except HTTPError as e:
             errors.append(
-                f"{url}: 投稿なし"
+                f"{rss_url}: HTTP {e.code}"
+            )
+
+        except URLError as e:
+            errors.append(
+                f"{rss_url}: {e.reason}"
             )
 
         except Exception as e:
-
-            print(
-                f"[WARN] RSS取得失敗: {e}"
-            )
-
             errors.append(
-                f"{url}: {e}"
+                f"{rss_url}: {e}"
             )
 
-    raise RuntimeError(
-        "RSSを取得できませんでした: "
-        + " / ".join(errors)
+    if not all_posts:
+        error_text = "\n".join(errors)
+
+        raise RuntimeError(
+            "すべてのRSSから有効な投稿を取得できませんでした。\n"
+            + error_text
+        )
+
+    posts = list(all_posts.values())
+
+    posts.sort(
+        key=lambda x: x["datetime"]
     )
 
+    return posts
 
-# =========================================================
-# History
-# =========================================================
 
-def load_history():
-
+def load_data():
     if not os.path.exists(DATA_FILE):
-        return []
+        return {"posts": []}
 
     try:
-
         with open(
             DATA_FILE,
             "r",
-            encoding="utf-8",
+            encoding="utf-8"
         ) as f:
-
             data = json.load(f)
 
-        if isinstance(data, dict):
-            history = data.get(
-                "posts",
-                [],
-            )
+        if not isinstance(data, dict):
+            return {"posts": []}
 
-        elif isinstance(data, list):
-            history = data
+        posts = data.get("posts", [])
 
-        else:
-            history = []
+        if not isinstance(posts, list):
+            posts = []
 
-        return history
+        return {"posts": posts}
 
-    except Exception as e:
-
+    except Exception:
         print(
-            f"[WARN] data.json読み込み失敗: {e}"
+            "data.jsonを読み込めなかったため、"
+            "空の履歴として扱います。"
         )
 
-        return []
+        return {"posts": []}
 
 
-def save_history(history):
-
-    data = {
-        "posts": history,
-        "updated_at": datetime.now(
-            UTC
-        ).isoformat(),
-    }
-
-    temp_fd, temp_path = tempfile.mkstemp(
-        prefix="data-",
-        suffix=".json",
-    )
-
-    try:
-
-        with os.fdopen(
-            temp_fd,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        os.replace(
-            temp_path,
-            DATA_FILE,
-        )
-
-    finally:
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def merge_history(
-    old_history,
-    new_posts,
-):
-
+def merge_posts(old_posts, new_posts):
     merged = {}
 
-    for post in old_history:
-
-        post_id = post.get(
-            "post_id"
-        )
+    for post in old_posts:
+        post_id = post.get("post_id")
 
         if post_id:
-            merged[post_id] = post
+            merged[str(post_id)] = post
 
     for post in new_posts:
+        post_id = post.get("post_id")
 
-        merged[
-            post["post_id"]
-        ] = post
+        if post_id:
+            merged[str(post_id)] = post
 
-    result = list(
-        merged.values()
-    )
+    result = list(merged.values())
 
     result.sort(
-        key=lambda x: x.get(
-            "datetime",
-            "",
-        )
-    )
-
-    return result[
-        -HISTORY_LIMIT:
-    ]
-
-
-# =========================================================
-# Convert history to datetime records
-# =========================================================
-
-def valid_history(history):
-
-    result = []
-
-    for post in history:
-
-        try:
-
-            dt = datetime.fromisoformat(
-                post["datetime"]
-            )
-
-            if dt.tzinfo is None:
-                dt = dt.replace(
-                    tzinfo=JST
-                )
-
-            dt = dt.astimezone(JST)
-
-            result.append(
-                (
-                    dt,
-                    post,
-                )
-            )
-
-        except Exception:
-            continue
-
-    result.sort(
-        key=lambda x: x[0]
+        key=lambda x: x.get("datetime", "")
     )
 
     return result
 
 
-# =========================================================
-# Learn weekday statistics
-# =========================================================
+def build_daily_history(posts):
+    daily = {}
 
-def learn_weekday_statistics(history):
+    for post in posts:
+        dt = parse_datetime(
+            post.get("datetime", "")
+        )
 
-    records = valid_history(
-        history
-    )
+        if dt is None:
+            continue
 
-    # -----------------------------------------------------
-    # 曜日ごとの実績
-    # -----------------------------------------------------
+        date = dt.date()
 
-    weekday_counts = {
+        if date not in daily:
+            daily[date] = []
+
+        daily[date].append(dt)
+
+    for date in daily:
+        daily[date].sort()
+
+    return daily
+
+
+def calculate_weekday_probabilities(daily_history):
+    if not daily_history:
+        return {}
+
+    first_date = min(daily_history.keys())
+    last_date = max(daily_history.keys())
+
+    weekday_total = {
         weekday: 0
         for weekday in range(7)
     }
 
-    weekday_times = {
-        weekday: []
+    weekday_active = {
+        weekday: 0
         for weekday in range(7)
     }
 
-    # 実際に「その曜日だった日」の数
-    observed_dates = {
-        weekday: set()
-        for weekday in range(7)
-    }
+    current = first_date
 
-    for dt, _ in records:
+    while current <= last_date:
+        weekday = current.weekday()
+        weekday_total[weekday] += 1
 
-        weekday = dt.weekday()
+        if current in daily_history:
+            weekday_active[weekday] += 1
 
-        weekday_counts[
-            weekday
-        ] += 1
+        current += timedelta(days=1)
 
-        observed_dates[
-            weekday
-        ].add(
-            dt.date()
-        )
-
-        minutes = (
-            dt.hour * 60
-            + dt.minute
-            + dt.second / 60
-        )
-
-        weekday_times[
-            weekday
-        ].append(minutes)
-
-    # -----------------------------------------------------
-    # 曜日別の時間平均
-    # -----------------------------------------------------
-
-    weekday_average_minutes = {}
+    probabilities = {}
 
     for weekday in range(7):
+        total = weekday_total[weekday]
+        active = weekday_active[weekday]
 
-        values = weekday_times[
-            weekday
-        ]
-
-        if not values:
-            continue
-
-        weekday_average_minutes[
-            weekday
-        ] = circular_average_minutes(
-            values
-        )
-
-    # -----------------------------------------------------
-    # 学習結果表示
-    # -----------------------------------------------------
-
-    names = [
-        "月曜日",
-        "火曜日",
-        "水曜日",
-        "木曜日",
-        "金曜日",
-        "土曜日",
-        "日曜日",
-    ]
-
-    print(
-        "[INFO] ===== 過去データ学習結果 ====="
-    )
-
-    total_posts = len(records)
-
-    print(
-        f"[INFO] 学習対象投稿数: "
-        f"{total_posts}件"
-    )
-
-    for weekday in range(7):
-
-        count = weekday_counts[
-            weekday
-        ]
-
-        if total_posts:
-            share = (
-                count
-                / total_posts
-                * 100
-            )
+        if total <= 0:
+            probabilities[weekday] = 0.0
         else:
-            share = 0
+            probabilities[weekday] = active / total
 
-        average = weekday_average_minutes.get(
-            weekday
-        )
-
-        if average is not None:
-
-            hour = int(
-                average // 60
-            )
-
-            minute = int(
-                average % 60
-            )
-
-            time_text = (
-                f"{hour:02d}:{minute:02d}"
-            )
-
-        else:
-
-            time_text = "--:--"
-
-        print(
-            f"[INFO] {names[weekday]}: "
-            f"{count}件 / "
-            f"{share:.1f}% / "
-            f"平均 {time_text}"
-        )
-
-    print(
-        "[INFO] ============================="
-    )
-
-    return {
-        "weekday_counts": weekday_counts,
-        "weekday_times": weekday_times,
-        "weekday_average_minutes":
-            weekday_average_minutes,
-        "total_posts": total_posts,
-    }
+    return probabilities
 
 
-# =========================================================
-# Circular average
-# =========================================================
-
-def circular_average_minutes(
-    values
-):
-
+def circular_average_minutes(values):
     if not values:
         return None
 
-    angles = [
-        (
-            minutes
-            / 1440.0
-            * 2
-            * math.pi
-        )
-        for minutes in values
-    ]
+    angles = []
+
+    for minutes in values:
+        angle = (
+            minutes / 1440
+        ) * 2 * math.pi
+
+        angles.append(angle)
 
     sin_sum = sum(
         math.sin(angle)
@@ -695,690 +488,593 @@ def circular_average_minutes(
         for angle in angles
     )
 
-    angle = math.atan2(
+    average_angle = math.atan2(
         sin_sum,
-        cos_sum,
+        cos_sum
     )
 
-    if angle < 0:
-        angle += 2 * math.pi
+    if average_angle < 0:
+        average_angle += 2 * math.pi
 
-    average = (
-        angle
+    minutes = (
+        average_angle
         / (2 * math.pi)
-        * 1440.0
+        * 1440
     )
 
-    return int(
-        round(average)
-    ) % 1440
+    return int(round(minutes)) % 1440
 
 
-# =========================================================
-# Historical probability
-# =========================================================
+def calculate_weekday_start_times(daily_history):
+    values = {
+        weekday: []
+        for weekday in range(7)
+    }
 
-def calculate_weekday_probability(
-    weekday,
-    history,
-):
+    for date, datetimes in daily_history.items():
+        if not datetimes:
+            continue
 
-    records = valid_history(
-        history
-    )
+        first_dt = datetimes[0]
 
-    if len(records) < MIN_HISTORY_FOR_PREDICTION:
-        return 0.0
-
-    # -----------------------------------------------------
-    # 履歴の「日付範囲」を求める
-    # -----------------------------------------------------
-
-    first_date = records[0][0].date()
-    last_date = records[-1][0].date()
-
-    total_days = (
-        last_date - first_date
-    ).days + 1
-
-    if total_days <= 0:
-        return 0.0
-
-    # -----------------------------------------------------
-    # その曜日が存在した日数
-    # -----------------------------------------------------
-
-    total_weekday_days = 0
-
-    current = first_date
-
-    while current <= last_date:
-
-        if current.weekday() == weekday:
-            total_weekday_days += 1
-
-        current += timedelta(
-            days=1
+        minutes = (
+            first_dt.hour * 60
+            + first_dt.minute
+            + round(first_dt.second / 60)
         )
 
-    if total_weekday_days <= 0:
-        return 0.0
+        values[date.weekday()].append(minutes)
 
-    # -----------------------------------------------------
-    # 実際に配信した曜日の日数
-    # -----------------------------------------------------
+    result = {}
 
-    actual_dates = set()
+    for weekday in range(7):
+        result[weekday] = circular_average_minutes(
+            values[weekday]
+        )
 
-    for dt, _ in records:
+    return result
 
-        if dt.weekday() == weekday:
-            actual_dates.add(
-                dt.date()
+
+def generate_predictions(
+    daily_history,
+    probabilities,
+    start_times,
+    today
+):
+    if len(daily_history) < MIN_ACTIVE_DAYS:
+        print(
+            "実績が少ないため、予測は作成しません。"
+        )
+        return []
+
+    predictions = []
+
+    accumulators = {
+        weekday: 0.0
+        for weekday in range(7)
+    }
+
+    for offset in range(
+        1,
+        PREDICTION_DAYS + 1
+    ):
+        date = today + timedelta(
+            days=offset
+        )
+
+        weekday = date.weekday()
+
+        probability = probabilities.get(
+            weekday,
+            0.0
+        )
+
+        start_minutes = start_times.get(
+            weekday
+        )
+
+        if probability <= 0:
+            continue
+
+        if start_minutes is None:
+            continue
+
+        accumulators[weekday] += probability
+
+        if date in daily_history:
+            accumulators[weekday] = max(
+                0.0,
+                accumulators[weekday] - 1.0
+            )
+            continue
+
+        if accumulators[weekday] >= 1.0:
+            accumulators[weekday] -= 1.0
+
+            hour = start_minutes // 60
+            minute = start_minutes % 60
+
+            dt = datetime.combine(
+                date,
+                time(
+                    hour=hour,
+                    minute=minute
+                ),
+                tzinfo=JST
             )
 
-    # -----------------------------------------------------
-    # 発生率
-    # -----------------------------------------------------
+            predictions.append({
+                "date": date.isoformat(),
+                "datetime": dt.isoformat(),
+                "weekday": weekday,
+                "probability": probability,
+            })
 
-    probability = (
-        len(actual_dates)
-        / total_weekday_days
-    )
+    return predictions
 
-    return probability
-
-
-# =========================================================
-# Prediction decision
-# =========================================================
-
-def should_predict_date(
-    target_date,
-    history,
-    statistics,
-):
-
-    if (
-        statistics["total_posts"]
-        < MIN_HISTORY_FOR_PREDICTION
-    ):
-        return False
-
-    weekday = target_date.weekday()
-
-    probability = (
-        calculate_weekday_probability(
-            weekday,
-            history,
-        )
-    )
-
-    print(
-        f"[INFO] "
-        f"{target_date.isoformat()} "
-        f"{['月','火','水','木','金','土','日'][weekday]} "
-        f"過去発生率={probability * 100:.1f}%"
-    )
-
-    # ---------------------------------------------
-    # 高頻度曜日
-    # ---------------------------------------------
-
-    if probability >= 0.75:
-        return True
-
-    # ---------------------------------------------
-    # 中頻度曜日
-    #
-    # 過去の頻度をそのまま確率として使う。
-    # ---------------------------------------------
-
-    if probability >= MIN_PREDICTION_PROBABILITY:
-
-        # 日付から再現可能な疑似乱数を作る。
-        #
-        # 毎回Actionsを実行しても同じ日付なら
-        # 同じ判定になる。
-        seed = (
-            RANDOM_SEED
-            + target_date.toordinal()
-            * 100
-            + weekday
-        )
-
-        rng = random.Random(
-            seed
-        )
-
-        return (
-            rng.random()
-            < probability
-        )
-
-    return False
-
-
-# =========================================================
-# ICS escaping
-# =========================================================
 
 def escape_ics_text(value):
-
     if value is None:
         return ""
 
-    return (
-        str(value)
-        .replace(
-            "\\",
-            "\\\\",
-        )
-        .replace(
-            ";",
-            "\\;",
-        )
-        .replace(
-            ",",
-            "\\,",
-        )
-        .replace(
-            "\r\n",
-            "\\n",
-        )
-        .replace(
-            "\n",
-            "\\n",
-        )
-        .replace(
-            "\r",
-            "\\n",
-        )
+    value = str(value)
+
+    value = value.replace(
+        "\\",
+        "\\\\"
     )
 
+    value = value.replace(
+        ";",
+        "\\;"
+    )
 
-# =========================================================
-# ICS datetime
-# =========================================================
+    value = value.replace(
+        ",",
+        "\\,"
+    )
+
+    value = value.replace(
+        "\r\n",
+        "\\n"
+    )
+
+    value = value.replace(
+        "\n",
+        "\\n"
+    )
+
+    value = value.replace(
+        "\r",
+        "\\n"
+    )
+
+    return value
+
 
 def format_ics_datetime(dt):
-
-    return dt.strftime(
-        "%Y%m%dT%H%M%S"
-    )
-
-
-# =========================================================
-# Real event
-# =========================================================
-
-def make_real_event(post):
-
-    dt = datetime.fromisoformat(
-        post["datetime"]
-    )
-
     if dt.tzinfo is None:
         dt = dt.replace(
             tzinfo=JST
         )
 
-    dt = dt.astimezone(
-        JST
+    utc_dt = dt.astimezone(
+        timezone.utc
     )
 
-    end = dt + timedelta(
-        minutes=EVENT_DURATION_MINUTES
-    )
-
-    post_id = post[
-        "post_id"
-    ]
-
-    iriam_url = post[
-        "iriam_url"
-    ]
-
-    return "\n".join(
-        [
-            "BEGIN:VEVENT",
-            (
-                "UID:mega-iriam-real-"
-                f"{post_id}@calendar-mega"
-            ),
-            (
-                "DTSTAMP:"
-                + datetime.now(
-                    UTC
-                ).strftime(
-                    "%Y%m%dT%H%M%SZ"
-                )
-            ),
-            (
-                "DTSTART;TZID=Asia/Tokyo:"
-                + format_ics_datetime(dt)
-            ),
-            (
-                "DTEND;TZID=Asia/Tokyo:"
-                + format_ics_datetime(end)
-            ),
-            "SUMMARY:【配信開始】IRIAMライブ",
-            (
-                "DESCRIPTION:"
-                "X投稿から検出したIRIAM配信"
-            ),
-            f"URL:{iriam_url}",
-            (
-                f"X:https://x.com/{USERNAME}"
-                f"/status/{post_id}"
-            ),
-            "END:VEVENT",
-        ]
+    return utc_dt.strftime(
+        "%Y%m%dT%H%M%SZ"
     )
 
 
-# =========================================================
-# Prediction event
-# =========================================================
+def fold_ics_line(line):
+    result = []
+    current = ""
 
-def make_prediction_event(
-    target_date,
-    predicted_minutes,
+    for char in line:
+        test = current + char
+
+        if len(test.encode("utf-8")) > 75:
+            result.append(current)
+            current = " " + char
+        else:
+            current = test
+
+    if current:
+        result.append(current)
+
+    return "\r\n".join(result)
+
+
+def make_event(
+    uid,
+    start_dt,
+    summary,
+    description
 ):
-
-    hour = int(
-        predicted_minutes // 60
+    end_dt = (
+        start_dt
+        + timedelta(
+            minutes=EVENT_DURATION_MINUTES
+        )
     )
 
-    minute = int(
-        predicted_minutes % 60
+    dtstamp = format_ics_datetime(
+        start_dt
     )
 
-    dt = datetime.combine(
-        target_date,
-        time(
-            hour=hour,
-            minute=minute,
-        ),
-    ).replace(
-        tzinfo=JST
+    lines = [
+        "BEGIN:VEVENT",
+        f"UID:{escape_ics_text(uid)}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{format_ics_datetime(start_dt)}",
+        f"DTEND:{format_ics_datetime(end_dt)}",
+        f"SUMMARY:{escape_ics_text(summary)}",
+        f"DESCRIPTION:{escape_ics_text(description)}",
+        "END:VEVENT",
+    ]
+
+    return "\r\n".join(
+        fold_ics_line(line)
+        for line in lines
     )
 
-    end = dt + timedelta(
-        minutes=EVENT_DURATION_MINUTES
-    )
-
-    return "\n".join(
-        [
-            "BEGIN:VEVENT",
-            (
-                "UID:mega-iriam-prediction-"
-                f"{target_date.isoformat()}"
-                "@calendar-mega"
-            ),
-            (
-                "DTSTAMP:"
-                + datetime.now(
-                    UTC
-                ).strftime(
-                    "%Y%m%dT%H%M%SZ"
-                )
-            ),
-            (
-                "DTSTART;TZID=Asia/Tokyo:"
-                + format_ics_datetime(dt)
-            ),
-            (
-                "DTEND;TZID=Asia/Tokyo:"
-                + format_ics_datetime(end)
-            ),
-            "SUMMARY:【予測】IRIAMライブ",
-            (
-                "DESCRIPTION:"
-                "過去の同じ曜日のIRIAM配信投稿時刻"
-                "から学習して算出した予測です。"
-            ),
-            "END:VEVENT",
-        ]
-    )
-
-
-# =========================================================
-# Build calendar
-# =========================================================
 
 def build_calendar(
-    history
+    actual_posts,
+    predictions
 ):
-
-    now = datetime.now(
-        JST
-    )
-
     events = []
 
-    # =====================================================
-    # 実際の投稿
-    # =====================================================
+    actual_seen = set()
 
-    actual_dates = set()
-
-    for post in history:
-
-        try:
-
-            dt = datetime.fromisoformat(
-                post["datetime"]
-            )
-
-            if dt.tzinfo is None:
-                dt = dt.replace(
-                    tzinfo=JST
-                )
-
-            dt = dt.astimezone(
-                JST
-            )
-
-            actual_dates.add(
-                dt.date()
-            )
-
-            events.append(
-                (
-                    dt,
-                    make_real_event(
-                        post
-                    ),
-                )
-            )
-
-        except Exception:
-            continue
-
-    # =====================================================
-    # 過去データから学習
-    # =====================================================
-
-    statistics = learn_weekday_statistics(
-        history
-    )
-
-    # =====================================================
-    # 未来予測
-    # =====================================================
-
-    print(
-        "[INFO] ===== 未来予測 ====="
-    )
-
-    for offset in range(
-        1,
-        PREDICTION_DAYS + 1,
-    ):
-
-        target_date = (
-            now.date()
-            + timedelta(
-                days=offset
-            )
+    for post in actual_posts:
+        post_id = str(
+            post.get("post_id", "")
         )
 
-        # 実際の投稿が存在する日は予測しない
-        if target_date in actual_dates:
+        if not post_id:
             continue
 
-        weekday = target_date.weekday()
-
-        # その曜日の平均開始時刻が
-        # 学習できていなければ予測不能
-        if (
-            weekday
-            not in statistics[
-                "weekday_average_minutes"
-            ]
-        ):
+        if post_id in actual_seen:
             continue
 
-        # 過去の頻度から予測
-        if not should_predict_date(
-            target_date,
-            history,
-            statistics,
-        ):
-            continue
+        actual_seen.add(post_id)
 
-        predicted_minutes = (
-            statistics[
-                "weekday_average_minutes"
-            ][weekday]
+        dt = parse_datetime(
+            post.get("datetime", "")
         )
 
-        predicted_dt = datetime.combine(
-            target_date,
-            time(
-                hour=int(
-                    predicted_minutes // 60
-                ),
-                minute=int(
-                    predicted_minutes % 60
-                ),
+        if dt is None:
+            continue
+
+        url = post.get("url")
+
+        if not url:
+            url = (
+                f"https://x.com/"
+                f"{USERNAME}/status/{post_id}"
+            )
+
+        description = (
+            "Xの実際の投稿から検出された"
+            "IRIAMライブ開始情報です.\n"
+            f"{url}\n"
+            f"{post.get('iriam_url', '')}"
+        )
+
+        event = make_event(
+            uid=(
+                f"mega-iriam-real-"
+                f"{post_id}@calendar-mega"
             ),
-        ).replace(
-            tzinfo=JST
+            start_dt=dt,
+            summary="【配信開始】IRIAMライブ",
+            description=description
         )
 
         events.append(
-            (
-                predicted_dt,
-                make_prediction_event(
-                    target_date,
-                    predicted_minutes,
-                ),
+            (dt, event)
+        )
+
+    actual_dates = set()
+
+    for post in actual_posts:
+        dt = parse_datetime(
+            post.get("datetime", "")
+        )
+
+        if dt:
+            actual_dates.add(dt.date())
+
+    prediction_seen = set()
+
+    for prediction in predictions:
+        date_string = prediction.get(
+            "date"
+        )
+
+        if not date_string:
+            continue
+
+        if date_string in prediction_seen:
+            continue
+
+        prediction_seen.add(date_string)
+
+        try:
+            date = datetime.strptime(
+                date_string,
+                "%Y-%m-%d"
+            ).date()
+
+        except ValueError:
+            continue
+
+        if date in actual_dates:
+            continue
+
+        dt = parse_datetime(
+            prediction.get(
+                "datetime",
+                ""
             )
         )
 
-        print(
-            f"[PREDICT] "
-            f"{target_date} "
-            f"{['月','火','水','木','金','土','日'][weekday]} "
-            f"{predicted_dt.strftime('%H:%M')}"
+        if dt is None:
+            continue
+
+        probability = prediction.get(
+            "probability",
+            0
         )
 
-    print(
-        "[INFO] ==================="
-    )
+        description = (
+            "過去のIRIAM配信実績を学習して"
+            "予測した配信開始日時です.\n"
+            f"学習確率: {probability:.1%}"
+        )
 
-    # =====================================================
-    # 日時順
-    # =====================================================
+        event = make_event(
+            uid=(
+                f"mega-iriam-prediction-"
+                f"{date_string}@calendar-mega"
+            ),
+            start_dt=dt,
+            summary="【予測】IRIAMライブ",
+            description=description
+        )
+
+        events.append(
+            (dt, event)
+        )
 
     events.sort(
-        key=lambda x: x[0]
+        key=lambda item: item[0]
     )
 
-    return events
-
-
-# =========================================================
-# Write calendar
-# =========================================================
-
-def write_calendar(
-    events
-):
-
-    lines = [
+    header = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        "PRODID:-//Koqi//Calendar-Mega//JP",
+        "PRODID:-//Calendar-Mega//IRIAM Calendar//JA",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        "X-WR-CALNAME:メガ・ウルトラギガ IRIAM配信",
+        "X-WR-CALNAME:メガ・ウルトラギガ IRIAM配信カレンダー",
         "X-WR-TIMEZONE:Asia/Tokyo",
     ]
 
-    for _, event in events:
-        lines.append(
-            event
-        )
-
-    lines.append(
+    footer = [
         "END:VCALENDAR"
-    )
+    ]
 
-    content = (
-        "\r\n".join(lines)
-        + "\r\n"
-    )
+    all_lines = []
 
-    # RSS取得が正常なのに0件になった場合も
-    # 既存カレンダーを破壊しない
-    if (
-        not events
-        and os.path.exists(
-            OUTPUT_ICS
-        )
-    ):
-
-        print(
-            "[WARN] イベントが0件なので、"
-            "既存calendar.icsを保持します。"
+    for line in header:
+        all_lines.append(
+            fold_ics_line(line)
         )
 
-        return
+    for _, event in events:
+        all_lines.append(event)
 
-    temp_fd, temp_path = tempfile.mkstemp(
-        prefix="calendar-",
-        suffix=".ics",
-    )
-
-    try:
-
-        with os.fdopen(
-            temp_fd,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as f:
-
-            f.write(
-                content
-            )
-
-        os.replace(
-            temp_path,
-            OUTPUT_ICS
+    for line in footer:
+        all_lines.append(
+            fold_ics_line(line)
         )
 
-    finally:
+    return "\r\n".join(
+        all_lines
+    ) + "\r\n"
 
-        if os.path.exists(
-            temp_path
-        ):
-            os.remove(
-                temp_path
-            )
-
-
-# =========================================================
-# Main
-# =========================================================
 
 def main():
+    print("=" * 60)
+    print("Calendar-Mega 更新開始")
+    print("=" * 60)
+
+    print("RSSを取得しています...")
+
+    try:
+        new_posts = fetch_posts()
+
+    except Exception as e:
+        print("RSS取得に失敗しました。")
+        print(str(e))
+        print(
+            "既存のcalendar.icsとdata.jsonは"
+            "変更しません。"
+        )
+        raise
 
     print(
-        "========================================"
+        f"今回取得した対象投稿: "
+        f"{len(new_posts)}件"
     )
 
-    print(
-        " Mega IRIAM Calendar"
-    )
+    data = load_data()
 
-    print(
-        " Past-learning prediction system"
-    )
-
-    print(
-        "========================================"
-    )
-
-    # -----------------------------------------------------
-    # RSS
-    # -----------------------------------------------------
-
-    posts = fetch_posts()
-
-    # -----------------------------------------------------
-    # 履歴
-    # -----------------------------------------------------
-
-    old_history = load_history()
-
-    print(
-        f"[INFO] 保存済み履歴: "
-        f"{len(old_history)}件"
-    )
-
-    history = merge_history(
-        old_history,
-        posts,
+    old_posts = data.get(
+        "posts",
+        []
     )
 
     print(
-        f"[INFO] 統合後履歴: "
-        f"{len(history)}件"
+        f"保存済み履歴: "
+        f"{len(old_posts)}件"
     )
 
-    # -----------------------------------------------------
-    # 保存
-    # -----------------------------------------------------
-
-    save_history(
-        history
-    )
-
-    # -----------------------------------------------------
-    # カレンダー生成
-    # -----------------------------------------------------
-
-    events = build_calendar(
-        history
-    )
-
-    real_count = sum(
-        1
-        for _, event in events
-        if "UID:mega-iriam-real-" in event
-    )
-
-    prediction_count = sum(
-        1
-        for _, event in events
-        if "UID:mega-iriam-prediction-" in event
+    all_posts = merge_posts(
+        old_posts,
+        new_posts
     )
 
     print(
-        f"[INFO] 実績イベント: "
-        f"{real_count}件"
+        f"統合後の全履歴: "
+        f"{len(all_posts)}件"
+    )
+
+    daily_history = build_daily_history(
+        all_posts
     )
 
     print(
-        f"[INFO] 予測イベント: "
-        f"{prediction_count}件"
+        f"活動実績日数: "
+        f"{len(daily_history)}日"
     )
 
-    # -----------------------------------------------------
-    # ICS
-    # -----------------------------------------------------
-
-    write_calendar(
-        events
+    probabilities = (
+        calculate_weekday_probabilities(
+            daily_history
+        )
     )
 
+    weekday_names = [
+        "月",
+        "火",
+        "水",
+        "木",
+        "金",
+        "土",
+        "日",
+    ]
+
+    print("")
+    print("曜日別配信確率:")
+
+    for weekday in range(7):
+        probability = probabilities.get(
+            weekday,
+            0
+        )
+
+        print(
+            f"  {weekday_names[weekday]}曜日: "
+            f"{probability:.1%}"
+        )
+
+    start_times = (
+        calculate_weekday_start_times(
+            daily_history
+        )
+    )
+
+    print("")
+    print("曜日別学習開始時刻:")
+
+    for weekday in range(7):
+        minutes = start_times.get(
+            weekday
+        )
+
+        if minutes is None:
+            print(
+                f"  {weekday_names[weekday]}曜日: "
+                f"データなし"
+            )
+
+        else:
+            hour = minutes // 60
+            minute = minutes % 60
+
+            print(
+                f"  {weekday_names[weekday]}曜日: "
+                f"{hour:02d}:{minute:02d}"
+            )
+
+    now = datetime.now(JST)
+    today = now.date()
+
+    print("")
     print(
-        "[INFO] calendar.ics更新完了"
+        f"現在: "
+        f"{now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
     )
+
+    predictions = generate_predictions(
+        daily_history=daily_history,
+        probabilities=probabilities,
+        start_times=start_times,
+        today=today
+    )
+
+    print("")
+    print(
+        f"生成した予測イベント: "
+        f"{len(predictions)}件"
+    )
+
+    for prediction in predictions:
+        print(
+            "  "
+            f"{prediction['datetime']} "
+            f"(確率 "
+            f"{prediction['probability']:.1%})"
+        )
+
+    calendar_content = build_calendar(
+        actual_posts=all_posts,
+        predictions=predictions
+    )
+
+    event_count = calendar_content.count(
+        "BEGIN:VEVENT"
+    )
+
+    if event_count == 0:
+        raise RuntimeError(
+            "生成されたcalendar.icsに"
+            "イベントが1件もありません。"
+            "既存ファイルを上書きしません。"
+        )
+
+    print("")
+    print(
+        f"calendar.icsイベント数: "
+        f"{event_count}"
+    )
+
+    data_content = json.dumps(
+        {
+            "posts": all_posts
+        },
+        ensure_ascii=False,
+        indent=2
+    ) + "\n"
+
+    atomic_write(
+        DATA_FILE,
+        data_content
+    )
+
+    atomic_write(
+        ICS_FILE,
+        calendar_content
+    )
+
+    print("")
+    print("=" * 60)
+    print("Calendar-Mega 更新完了")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
