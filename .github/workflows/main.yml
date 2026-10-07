@@ -1,34 +1,59 @@
-name: Generate IRIAM Calendar
+name: Update Mega IRIAM Calendar
+
 on:
   schedule:
-    - cron: '*/10 * * * *' # 10分ごとに実行（エラー回避と即時性のベストバランス）
+    # 15分ごと
+    # 毎時00分を避けて実行
+    - cron: "07,22,37,52 * * * *"
+
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: calendar-update
+  cancel-in-progress: false
+
 jobs:
-  build:
+  update-calendar:
+
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
+    timeout-minutes: 5
 
     steps:
-      - name: Checkout repo
+
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Generate calendar
         run: |
-          pip install feedparser ics python-dateutil pytz
+          python main.py
 
-      - name: Run script
-        run: python main.py
+      - name: Check changes
+        id: changes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Commit and Push
+      - name: Commit and push
+        if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data.json calendar.ics
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update calendar" && git push)
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add calendar.ics data.json
+
+          git commit -m "Update IRIAM calendar"
+
+          git push
