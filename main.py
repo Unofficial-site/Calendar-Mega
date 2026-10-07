@@ -1,5 +1,6 @@
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -19,7 +20,6 @@ USERNAME = "mega_urtr"
 
 IRIAM_PREFIX = "https://web.iriam.app/s/live/"
 
-# 無料RSS取得先
 RSS_URLS = [
     f"https://fxtwitter.com/{USERNAME}/feed.xml?count=100",
     f"https://fxtwitter.com/{USERNAME}/feed.atom.xml?count=100",
@@ -31,17 +31,45 @@ DATA_FILE = "data.json"
 JST = ZoneInfo("Asia/Tokyo")
 UTC = timezone.utc
 
-# 予測を何日先まで作るか
+# 何日先まで予測するか
 PREDICTION_DAYS = 60
 
 # 平均時刻に使用する直近の投稿数
 HISTORY_LIMIT = 60
 
-# カレンダー上の配信時間
+# 1イベントの長さ
 EVENT_DURATION_MINUTES = 30
 
 # RSS取得タイムアウト
 HTTP_TIMEOUT = 20
+
+
+# ============================================================
+# 曜日予測設定
+# ============================================================
+
+# 曜日番号
+# 月=0 火=1 水=2 木=3 金=4 土=5 日=6
+
+WEEKDAY_NAMES = [
+    "月",
+    "火",
+    "水",
+    "木",
+    "金",
+    "土",
+    "日",
+]
+
+# 最低でもこの件数以上ある曜日を候補にする
+MIN_WEEKDAY_COUNT = 2
+
+# 最大出現数に対してこの割合以上なら「主要曜日」
+CORE_WEEKDAY_RATIO = 0.50
+
+# 最大出現数に対してこの割合以上なら「準主要曜日」
+# ただし、予測頻度を下げる
+SECONDARY_WEEKDAY_RATIO = 0.35
 
 
 # ============================================================
@@ -150,7 +178,6 @@ def fetch_feed():
     for url in RSS_URLS:
         try:
             body = fetch_url(url)
-
             root = ET.fromstring(body)
 
             print(f"[INFO] RSS取得成功: {url}")
@@ -205,26 +232,9 @@ def find_items(root):
     return items
 
 
-def clean_text(value):
-    if not value:
-        return ""
-
-    value = html.unescape(value)
-
-    value = re.sub(
-        r"<[^>]+>",
-        " ",
-        value
-    )
-
-    value = re.sub(
-        r"\s+",
-        " ",
-        value
-    )
-
-    return value.strip()
-
+# ============================================================
+# IRIAM URL
+# ============================================================
 
 def extract_iriam_url(text):
     if not text:
@@ -423,7 +433,7 @@ def parse_matching_posts(root):
         combined = " ".join([
             title,
             description,
-            link
+            link or ""
         ])
 
         combined = html.unescape(
@@ -494,10 +504,12 @@ def merge_posts(data, new_posts):
         )
 
         if post_id not in by_id:
+
             by_id[post_id] = post
             added += 1
 
         else:
+
             old = by_id[post_id]
 
             for key in [
@@ -505,6 +517,7 @@ def merge_posts(data, new_posts):
                 "url",
                 "iriam_url"
             ]:
+
                 if post.get(key):
                     old[key] = post[key]
 
@@ -525,7 +538,7 @@ def merge_posts(data, new_posts):
 
 
 # ============================================================
-# 平均配信時刻
+# 有効な投稿日時
 # ============================================================
 
 def valid_post_datetimes(posts):
@@ -534,6 +547,7 @@ def valid_post_datetimes(posts):
     for post in posts:
 
         try:
+
             dt = datetime.fromisoformat(
                 post["datetime"]
             )
@@ -555,23 +569,18 @@ def valid_post_datetimes(posts):
     return result
 
 
-def calculate_average_minutes(posts):
-    dates = valid_post_datetimes(
-        posts
-    )
+# ============================================================
+# 円環平均時刻
+# ============================================================
 
-    if not dates:
+def circular_average_minutes(datetimes):
+
+    if not datetimes:
         return None
-
-    dates = dates[
-        -HISTORY_LIMIT:
-    ]
-
-    import math
 
     minutes = []
 
-    for dt in dates:
+    for dt in datetimes:
 
         value = (
             dt.hour * 60
@@ -581,7 +590,6 @@ def calculate_average_minutes(posts):
 
         minutes.append(value)
 
-    # 0:00と23:59を正しく平均できる円環平均
     x = 0
     y = 0
 
@@ -598,6 +606,7 @@ def calculate_average_minutes(posts):
         y += math.sin(angle)
 
     if x == 0 and y == 0:
+
         return round(
             sum(minutes)
             / len(minutes)
@@ -623,7 +632,152 @@ def calculate_average_minutes(posts):
 
 
 # ============================================================
-# カレンダーイベント
+# 曜日別データ分析
+# ============================================================
+
+def analyze_weekdays(posts):
+
+    dates = valid_post_datetimes(
+        posts
+    )
+
+    dates = dates[
+        -HISTORY_LIMIT:
+    ]
+
+    weekday_data = {}
+
+    for weekday in range(7):
+        weekday_data[weekday] = {
+            "count": 0,
+            "times": []
+        }
+
+    for dt in dates:
+
+        weekday = dt.weekday()
+
+        weekday_data[weekday]["count"] += 1
+        weekday_data[weekday]["times"].append(dt)
+
+    counts = [
+        weekday_data[i]["count"]
+        for i in range(7)
+    ]
+
+    max_count = max(counts) if counts else 0
+
+    print("")
+    print("[INFO] 曜日別配信実績")
+
+    for weekday in range(7):
+
+        count = weekday_data[weekday]["count"]
+
+        print(
+            f"       {WEEKDAY_NAMES[weekday]}曜日: "
+            f"{count}件"
+        )
+
+    print("")
+
+    if max_count == 0:
+        return weekday_data
+
+    # ----------------------------------------
+    # 主要曜日・準主要曜日の判定
+    # ----------------------------------------
+
+    for weekday in range(7):
+
+        count = weekday_data[weekday]["count"]
+
+        if count < MIN_WEEKDAY_COUNT:
+
+            weekday_data[weekday]["level"] = "none"
+
+        elif count >= max_count * CORE_WEEKDAY_RATIO:
+
+            weekday_data[weekday]["level"] = "core"
+
+        elif count >= max_count * SECONDARY_WEEKDAY_RATIO:
+
+            weekday_data[weekday]["level"] = "secondary"
+
+        else:
+
+            weekday_data[weekday]["level"] = "none"
+
+        times = weekday_data[weekday]["times"]
+
+        weekday_data[weekday]["average_minutes"] = (
+            circular_average_minutes(times)
+        )
+
+    print("[INFO] 予測対象曜日")
+
+    for weekday in range(7):
+
+        info = weekday_data[weekday]
+
+        if info["level"] == "core":
+
+            print(
+                f"       {WEEKDAY_NAMES[weekday]}曜日: "
+                f"主要曜日"
+            )
+
+        elif info["level"] == "secondary":
+
+            print(
+                f"       {WEEKDAY_NAMES[weekday]}曜日: "
+                f"準主要曜日"
+            )
+
+    print("")
+
+    return weekday_data
+
+
+# ============================================================
+# 予測対象曜日かどうか
+# ============================================================
+
+def should_predict_weekday(
+    weekday_data,
+    weekday,
+    target_day
+):
+    info = weekday_data[weekday]
+
+    level = info.get(
+        "level",
+        "none"
+    )
+
+    if level == "core":
+        return True
+
+    if level != "secondary":
+        return False
+
+    # --------------------------------------------------------
+    # 準主要曜日は毎週ではなく、約2週間に1回程度にする
+    # --------------------------------------------------------
+
+    # その日付を基準にした簡易ローテーション
+    # 同じ曜日でも毎週予測されないようにする
+
+    week_number = (
+        target_day.toordinal()
+        // 7
+    )
+
+    return week_number % 2 == 0
+
+
+# ============================================================
+# 実績イベント
 # ============================================================
 
 def make_real_event(post):
@@ -648,7 +802,6 @@ def make_real_event(post):
         ),
 
         "dtstart": dt,
-
         "dtend": end,
 
         "summary": "【配信開始】IRIAMライブ",
@@ -669,18 +822,17 @@ def make_real_event(post):
     }
 
 
+# ============================================================
+# 予測イベント
+# ============================================================
+
 def make_prediction_event(
     target_day,
     average_minutes
 ):
 
-    hour = (
-        average_minutes // 60
-    )
-
-    minute = (
-        average_minutes % 60
-    )
+    hour = average_minutes // 60
+    minute = average_minutes % 60
 
     dt = datetime.combine(
         target_day,
@@ -703,13 +855,12 @@ def make_prediction_event(
         ),
 
         "dtstart": dt,
-
         "dtend": end,
 
         "summary": "【予測】IRIAMライブ",
 
         "description": (
-            "過去のIRIAM配信投稿時刻から"
+            "過去の同曜日のIRIAM配信投稿時刻から"
             "算出した予測です。"
         ),
 
@@ -718,6 +869,10 @@ def make_prediction_event(
         "type": "prediction"
     }
 
+
+# ============================================================
+# カレンダーイベント生成
+# ============================================================
 
 def build_events(posts):
 
@@ -732,6 +887,7 @@ def build_events(posts):
     for post in posts:
 
         try:
+
             event = make_real_event(
                 post
             )
@@ -745,38 +901,22 @@ def build_events(posts):
             )
 
         except Exception as e:
+
             print(
                 "[WARN] 実績イベント作成失敗: "
                 f"{e}"
             )
 
     # ----------------------------------------
-    # 平均時刻
+    # 曜日分析
     # ----------------------------------------
 
-    average_minutes = (
-        calculate_average_minutes(
-            posts
-        )
-    )
-
-    if average_minutes is None:
-
-        print(
-            "[INFO] 過去の対象投稿がないため、"
-            "予測イベントは作成しません。"
-        )
-
-        return events
-
-    print(
-        "[INFO] 平均配信時刻: "
-        f"{average_minutes // 60:02d}:"
-        f"{average_minutes % 60:02d}"
+    weekday_data = analyze_weekdays(
+        posts
     )
 
     # ----------------------------------------
-    # 未来の予測
+    # 未来予測
     # ----------------------------------------
 
     now = datetime.now(
@@ -784,6 +924,8 @@ def build_events(posts):
     )
 
     today = now.date()
+
+    prediction_count = 0
 
     for offset in range(
         0,
@@ -795,20 +937,35 @@ def build_events(posts):
             + timedelta(days=offset)
         )
 
-        # その日に実際の投稿がある
-        # → 予測を作らない
+        weekday = target_day.weekday()
+
+        # 実際の投稿がある日は予測しない
         if target_day in real_dates:
             continue
 
-        prediction = (
-            make_prediction_event(
-                target_day,
-                average_minutes
-            )
+        # この曜日を予測対象にするか
+        if not should_predict_weekday(
+            weekday_data,
+            weekday,
+            target_day
+        ):
+            continue
+
+        average_minutes = weekday_data[
+            weekday
+        ].get(
+            "average_minutes"
         )
 
-        # 今日の予測時刻を過ぎている
-        # → 今日の予測は作らない
+        if average_minutes is None:
+            continue
+
+        prediction = make_prediction_event(
+            target_day,
+            average_minutes
+        )
+
+        # 今日の予測時刻を過ぎている場合は作らない
         if (
             target_day == today
             and prediction["dtstart"] <= now
@@ -818,6 +975,13 @@ def build_events(posts):
         events.append(
             prediction
         )
+
+        prediction_count += 1
+
+    print(
+        f"[INFO] 予測イベント: "
+        f"{prediction_count}件"
+    )
 
     return events
 
@@ -869,7 +1033,6 @@ def ics_escape(value):
 def ics_fold(line):
 
     result = []
-
     current = ""
 
     for char in line:
@@ -893,6 +1056,7 @@ def ics_fold(line):
             )
 
         else:
+
             current = candidate
 
     if current:
@@ -1047,9 +1211,7 @@ def main():
 
     try:
 
-        root, source_url = (
-            fetch_feed()
-        )
+        root, source_url = fetch_feed()
 
     except Exception as e:
 
@@ -1072,10 +1234,8 @@ def main():
     # 対象投稿解析
     # ----------------------------------------
 
-    new_posts = (
-        parse_matching_posts(
-            root
-        )
+    new_posts = parse_matching_posts(
+        root
     )
 
     print(
@@ -1084,7 +1244,7 @@ def main():
     )
 
     # ----------------------------------------
-    # 取得成功だが0件
+    # RSS取得成功だが0件
     # ----------------------------------------
 
     if (
